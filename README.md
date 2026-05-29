@@ -88,8 +88,12 @@ conda activate sealab-vs
 
 git clone https://github.com/onuryus/sealab-vs.git 
 cd sealab-vs
-cmake -S . -B build
-cmake --build build -j
+
+rm -rf build
+mkdir build
+cd build
+cmake ..
+cmake --build . -j$(nproc)
 ```
 
 You get `build/sealab-vs`. The conda lib path is baked in as rpath, so the binary runs even without the env activated.
