@@ -86,7 +86,7 @@ conda create -n sealab-vs -c conda-forge \
     librdkit-dev boost-cpp cmake cxx-compiler make
 conda activate sealab-vs
 
-git clone https://github.com/<user>/sealab-vs.git
+git clone https://github.com/onuryus/sealab-vs.git 
 cd sealab-vs
 cmake -S . -B build
 cmake --build build -j
