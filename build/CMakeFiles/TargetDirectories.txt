@@ -1,0 +1,3 @@
+/home/mono/Documents/projeler/sanal_tarama/sealab-vs/build/CMakeFiles/sealab-vs.dir
+/home/mono/Documents/projeler/sanal_tarama/sealab-vs/build/CMakeFiles/edit_cache.dir
+/home/mono/Documents/projeler/sanal_tarama/sealab-vs/build/CMakeFiles/rebuild_cache.dir
