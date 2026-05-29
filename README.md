@@ -14,6 +14,7 @@ A Sealab Project.
 - [Quick start](#quick-start)
 - [Parameter reference](#parameter-reference)
 - [Screening presets](#screening-presets)
+- [How `--prefilter` works](#how---prefilter-works)
 - [Output format](#output-format)
 - [Performance](#performance)
 - [Documentation](#documentation)
@@ -36,7 +37,7 @@ It is **standalone**. No GUI, no database, no network. Input: one file + one SMI
 
 ### Why C++?
 
-The original prototype was a single-threaded Python script and could not keep up with modern library sizes. The C++ rewrite uses RDKit C++, OpenMP, and a custom streaming reader to process ~2 000 mol/s on 16 cores for the full pipeline, or ~60 000 mol/s for a fast prefilter pass — about 10–100× the Python version, with deterministic output.
+The original prototype was a single-threaded Python script and could not keep up with modern library sizes. The C++ rewrite uses RDKit C++, OpenMP, and a custom streaming reader. On a 16-core CPU it sustains **~4 600 mol/s on the full pipeline** or **~130 000 mol/s on the prefilter pass** (measured — see [Performance](#performance)), about an order of magnitude or more above the Python version, with deterministic output.
 
 ---
 
@@ -443,6 +444,86 @@ Tight fingerprint settings, narrow filters.
 
 ---
 
+## How `--prefilter` works
+
+Two-stage screening (the `--prefilter K` flag) is the single biggest
+performance lever in sealab-vs. The trade-off is real, though, so here is
+how it works in detail.
+
+### The cost problem
+
+Without `--prefilter`, every molecule in the library walks through the
+full pipeline:
+
+```
+parse → standardize → descriptors → rules → PAINS/BRENK → QED →
+optional alerts → BOILED-Egg → fingerprint → similarity → CSV
+```
+
+Most of that work is wasted on molecules that turn out to be irrelevant.
+If you are searching a 1 M-molecule library for analogs of aspirin, you
+do not really need to run PAINS substructure matching on methane.
+
+### The two-stage idea
+
+`--prefilter K` splits the work in two:
+
+**Stage 1 — fast similarity-only sweep over the entire library:**
+
+```
+parse → fingerprint → similarity → keep (similarity, raw SMILES)
+```
+
+No standardization, no descriptors, no rules, no alerts, no BOILED-Egg.
+Three cheap steps per molecule, ~130 000 mol/s on 16 cores.
+
+After Stage 1, `std::nth_element` picks the **top K** records by
+similarity in O(N) time — much cheaper than a full sort.
+
+**Stage 2 — full pipeline on those K molecules only:**
+
+The K molecules retained from Stage 1 are pushed through the complete
+pipeline (standardize, descriptors, rules, alerts, BOILED-Egg, …). All
+the expensive work happens here, but only on K records instead of N.
+
+### Why it is fast
+
+| Library size | Single stage | `--prefilter 10000` |
+|---|---:|---:|
+| 100 K mol | 22 s | < 1 s |
+| 1 M mol | 3.6 min | ~8 s |
+| 10 M mol | 36 min | ~80 s |
+
+For a 1 M library with K = 1 000, the speedup is around **25×** —
+almost the entire pipeline cost is replaced by a cheap similarity sweep.
+
+### The trade-off you must understand
+
+Stage 1 applies **no filters** — it ranks purely by similarity. This has
+two consequences:
+
+1. If the top-K molecules all happen to fail your filters
+   (e.g. they all match PAINS), Stage 2 produces zero hits even though
+   acceptable molecules might have existed further down the similarity
+   ranking.
+2. Molecules that look very similar to the target but fail an alert
+   filter still occupy slots in the top-K, displacing slightly less
+   similar molecules that would have passed.
+
+**Rule of thumb:** pick K to be **5–10× the number of hits you actually
+expect**. If you want ~100 candidates for docking, ask for `--prefilter
+1000` to leave slack.
+
+### When to use it
+
+| Situation | Decision |
+|---|---|
+| Library larger than ~100 K | **Use it** |
+| You want the highest-similarity candidates for docking | **Use it** |
+| Library smaller than ~10 K | Skip — single stage is already fast |
+| You want every molecule that passes your filters, regardless of rank | Skip — filters must run first |
+| Scaffold diversity matters more than similarity rank | Skip — top-K clusters near the target |
+
 ## Output format
 
 The CSV is sorted by descending similarity. One row per molecule that passes every selected gate. Columns:
@@ -465,19 +546,27 @@ Every column is populated for every surviving row, so post-hoc filtering in pand
 
 ## Performance
 
-Reference: 16-core Intel/AMD CPU.
+Measured on a 16-core CPU with a 100 000-molecule test library, default settings (Morgan/2048/radius 2, Tanimoto, Lipinski + Veber rules, PAINS + BRENK alerts, full standardization):
 
-| Mode | Throughput |
-|---|---|
-| Full pipeline (single stage) | ~1 500 – 2 500 mol/s |
-| Full pipeline + `--no-tautomer` | ~3 000 – 5 000 mol/s |
-| Stage 1 of `--prefilter` | ~50 000 – 80 000 mol/s |
+| Configuration | Time (100 k mol) | Throughput |
+|---|---:|---:|
+| Single thread (baseline) | 196.6 s | 508 mol/s |
+| 16 threads, full pipeline | **21.8 s** | **4 593 mol/s** |
+| 16 threads, `--no-tautomer` | 19.5 s | 5 126 mol/s |
+| 16 threads, `--no-standardize` | 17.6 s | 5 692 mol/s |
+| 16 threads, `--prefilter 1000` | **0.76 s** | **132 100 mol/s** |
 
-For a 10 M-molecule ZINC subset on 16 threads:
-- Single stage, full filtering: ~1 hour
-- Two-stage with `--prefilter 10000`: ~3 minutes
+**Multi-core scaling:** 9.0× on 16 threads (508 → 4 593 mol/s). Sub-linear because of heap-allocator contention — RDKit allocates 5–6 ROMol objects per molecule.
 
-Scales sub-linearly with cores (typically 6.5× on 16 threads) due to heap allocation contention.
+**Extrapolations** (same hardware, same defaults):
+
+| Library size | Single stage | Two-stage `--prefilter 10000` |
+|---|---:|---:|
+| 100 K mol | 22 s | < 1 s |
+| 1 M mol | 3.6 min | ~8 s |
+| 10 M mol | 36 min | ~80 s |
+
+Real diverse libraries (ZINC, Enamine REAL, ChEMBL subsets) behave very close to these synthetic numbers because parsing, standardization, and fingerprint cost dominate — not cache locality of unique SMILES.
 
 ---
 
@@ -487,6 +576,42 @@ Scales sub-linearly with cores (typically 6.5× on 16 threads) due to heap alloc
 - [`ARCHITECTURE.txt`](ARCHITECTURE.txt) — bilingual (EN/TR) detailed design, algorithms, formulas, references — intended as the methods reference for a manuscript
 
 ---
+
+## Acknowledgments & citations
+
+sealab-vs implements algorithms and rule sets from a number of openly
+published works. If you use the program in a publication, please cite the
+relevant primary references:
+
+- **RDKit** — Landrum, G. *RDKit: Open-source cheminformatics*. https://www.rdkit.org (BSD-3 license)
+- **QED** — Bickerton, G. R. et al. (2012) *Nat. Chem.* **4**, 90–98
+- **Lipinski Rule of Five** — Lipinski, C. A. et al. (1997) *Adv. Drug Deliv. Rev.* **23**, 3–25
+- **Veber rule** — Veber, D. F. et al. (2002) *J. Med. Chem.* **45**, 2615–2623
+- **Ghose filter** — Ghose, A. K. et al. (1999) *J. Comb. Chem.* **1**, 55–68
+- **Egan filter** — Egan, W. J. et al. (2000) *J. Med. Chem.* **43**, 3867–3877
+- **Muegge filter** — Muegge, I. et al. (2001) *J. Med. Chem.* **44**, 1841–1846
+- **Rule of Three** — Congreve, M. et al. (2003) *Drug Discov. Today* **8**, 876–877
+- **Lead-likeness** — Teague, S. J. et al. (1999) *Angew. Chem. Int. Ed.* **38**, 3743–3748
+- **REOS** — Walters, W. P. & Murcko, M. A. (2002) *Drug Discov. Today* **7**, S40–S47
+- **GSK 4/400 rule** — Gleeson, M. P. (2008) *J. Med. Chem.* **51**, 817–834
+- **Pfizer 3/75 rule** — Hughes, J. D. et al. (2008) *Bioorg. Med. Chem. Lett.* **18**, 4872–4875
+- **Fsp3** — Lovering, F. et al. (2009) *J. Med. Chem.* **52**, 6752–6756
+- **PAINS** — Baell, J. B. & Holloway, G. A. (2010) *J. Med. Chem.* **53**, 2719–2740
+- **BRENK alerts** — Brenk, R. et al. (2008) *ChemMedChem* **3**, 435–444
+- **Eli Lilly MedChem Rules** — Bruns, R. F. & Watson, I. A. (2012) *J. Med. Chem.* **55**, 9763–9772
+- **Inpharmatica alerts** — Sutherland, J. J. et al. (2003) *J. Chem. Inf. Comput. Sci.* **43**, 1666–1673
+- **Ames mutagenicity SMARTS** — Benigni, R. & Bossa, C. (2008) *Mutat. Res.* **659**, 248–261
+- **BOILED-Egg** — Daina, A. & Zoete, V. (2016) *ChemMedChem* **11**, 1117–1121
+- **BBB-MPO** — Wager, T. T. et al. (2010) *ACS Chem. Neurosci.* **1**, 435–449
+
+The SMARTS rule sets bundled by RDKit (PAINS, BRENK, Lilly MedChem Rules,
+Inpharmatica, NIH, ZINC, CHEMBL) are accessed via the RDKit FilterCatalog
+API; they originate from the respective open-access publications cited
+above and are not redistributed by this project independently of RDKit.
+
+The Ames and Aggregators SMARTS lists shipped in `src/chem.cpp` are
+small, hand-curated subsets of the patterns published in the
+corresponding peer-reviewed papers; users are welcome to extend them.
 
 ## License
 
