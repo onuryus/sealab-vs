@@ -328,17 +328,40 @@ void print_progress(const char* label, long done, long expected,
 }
 
 // ============================================================================
+// Bounded top-K comparator: with std::*_heap, this makes front() the
+// *smallest*-similarity element, so it's the cheap one to evict when a
+// better candidate shows up (min-heap-of-the-best-K idiom).
+// ============================================================================
+namespace {
+bool smallest_similarity_first(const Record& a, const Record& b) {
+  return a.similarity > b.similarity;
+}
+}  // namespace
+
+// ============================================================================
 // Generic streaming driver: reads the .smi file in locked batches and
 // dispatches each line through a caller-provided process function.
 // process_fn is either ChemContext::process (full pipeline) or
 // ChemContext::process_prefilter (stage-1 fast path).
+//
+// `cap`: if > 0, each thread keeps only its own best `cap` records (by
+// similarity) via a bounded min-heap instead of an unbounded vector. This
+// caps peak memory at threads * cap regardless of library size — required
+// for library-vs-RAM ratios where N (billions of rows) can't fit in memory
+// even though the final --prefilter K is small. The true global top-K is
+// still exact: it can only ever draw at most K rows from any single
+// thread's stream, so per-thread top-K is guaranteed to contain it.
+// cap <= 0 (default) preserves the old unbounded behavior, which is fine
+// for the classic single-stage path since real filters already keep the
+// hit list small.
 // ============================================================================
 template <typename ProcessFn>
 void stream_process(const std::string& path, const Options& o,
                     const SharedCatalogs& cats,
                     const ExplicitBitVect* target_fp, ProcessFn process_fn,
                     std::vector<Record>& sink, long& total_lines,
-                    long& parsed_ok, const char* label, long expected_total) {
+                    long& parsed_ok, const char* label, long expected_total,
+                    long cap = -1) {
   std::ifstream in(path);
   if (!in) {
     std::cerr << "Could not open file: " << path << "\n";
@@ -389,7 +412,19 @@ void stream_process(const std::string& path, const Options& o,
       for (auto& [ln, line] : batch) {
         Record r = process_fn(ctx, line, ln, o, target_fp);
         if (!r.smiles.empty()) ++local_parsed_ok;
-        if (r.valid) local.push_back(std::move(r));
+        if (r.valid) {
+          if (cap <= 0) {
+            local.push_back(std::move(r));
+          } else if ((long)local.size() < cap) {
+            local.push_back(std::move(r));
+            if ((long)local.size() == cap)
+              std::make_heap(local.begin(), local.end(), smallest_similarity_first);
+          } else if (r.similarity > local.front().similarity) {
+            std::pop_heap(local.begin(), local.end(), smallest_similarity_first);
+            local.back() = std::move(r);
+            std::push_heap(local.begin(), local.end(), smallest_similarity_first);
+          }
+        }
       }
       done_count.fetch_add(static_cast<long>(batch.size()));
     }
@@ -475,7 +510,8 @@ int main(int argc, char** argv) {
            const Options& opt, const ExplicitBitVect* tfp) {
           return ctx.process_prefilter(line, ln, opt, tfp);
         },
-        stage1, s1_lines, s1_parsed, "Prefilter", expected);
+        stage1, s1_lines, s1_parsed, "Prefilter", expected,
+        /*cap=*/o.prefilter_top);
 
     total_lines = s1_lines;
 
